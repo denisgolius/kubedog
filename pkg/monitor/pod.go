@@ -13,7 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	watchtools "k8s.io/client-go/tools/watch"
-	"k8s.io/kubernetes/pkg/apis/core"
 )
 
 type PodWatchMonitor struct {
@@ -133,12 +132,12 @@ func (pod *PodWatchMonitor) Watch() error {
 	defer cancel()
 
 	_, err = watchtools.UntilWithoutRetry(ctx, watcher, func(e watch.Event) (bool, error) {
-		object, ok := e.Object.(*core.Pod)
+		object, ok := e.Object.(*v1.Pod)
 		if !ok {
 			return true, fmt.Errorf("Expected %s to be a *core.Pod, got %T", pod.ResourceName, e.Object)
 		}
 
-		allContainerStatuses := make([]core.ContainerStatus, 0)
+		allContainerStatuses := make([]v1.ContainerStatus, 0)
 		for _, cs := range object.Status.InitContainerStatuses {
 			allContainerStatuses = append(allContainerStatuses, cs)
 		}
@@ -178,5 +177,5 @@ func (pod *PodWatchMonitor) Watch() error {
 		return false, nil
 	})
 
-	return nil
+	return err
 }

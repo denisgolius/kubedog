@@ -31,7 +31,7 @@ func main() {
 			name := args[0]
 			err := kubedog.WatchJobTillDone(name, namespace, kube.Kubernetes)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error watching job `%s` in namespace `%s`: %s", name, namespace, err)
+				fmt.Fprintf(os.Stderr, "Error watching job `%s` in namespace `%s`: %s\n", name, namespace, err)
 				os.Exit(1)
 			}
 		},
@@ -47,7 +47,7 @@ func main() {
 			name := args[0]
 			err := kubedog.WatchDeploymentTillReady(name, namespace)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error watching deployment `%s` in namespace `%s`: %s", name, namespace, err)
+				fmt.Fprintf(os.Stderr, "Error watching deployment `%s` in namespace `%s`: %s\n", name, namespace, err)
 				os.Exit(1)
 			}
 		},

@@ -20,17 +20,32 @@ type JobWatchFeedProto struct {
 }
 
 func (proto *JobWatchFeedProto) Started() error {
-	return proto.StartedFunc()
+	if proto.StartedFunc != nil {
+		return proto.StartedFunc()
+	}
+	return nil
 }
 func (proto *JobWatchFeedProto) Succeeded() error {
-	return proto.SucceededFunc()
+	if proto.SucceededFunc != nil {
+		return proto.SucceededFunc()
+	}
+	return nil
 }
 func (proto *JobWatchFeedProto) AddedPod(arg string) error {
-	return proto.AddedPodFunc(arg)
+	if proto.AddedPodFunc != nil {
+		return proto.AddedPodFunc(arg)
+	}
+	return nil
 }
 func (proto *JobWatchFeedProto) LogChunk(arg JobLogChunk) error {
-	return proto.LogChunkFunc(arg)
+	if proto.LogChunkFunc != nil {
+		return proto.LogChunkFunc(arg)
+	}
+	return nil
 }
 func (proto *JobWatchFeedProto) PodError(arg JobPodError) error {
-	return proto.PodErrorFunc(arg)
+	if proto.PodErrorFunc != nil {
+		return proto.PodErrorFunc(arg)
+	}
+	return nil
 }

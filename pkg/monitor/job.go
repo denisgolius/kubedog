@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	_ "k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +50,10 @@ func (job *JobWatchMonitor) Watch() error {
 	defer cancel()
 
 	_, err = watchtools.UntilWithoutRetry(ctx, watcher, func(e watch.Event) (bool, error) {
+		if debug() {
+			fmt.Printf("Job `%s` watcher event: %#v\n", job.ResourceName, e)
+		}
+
 		switch job.State {
 		case "":
 			if e.Type == watch.Added {
@@ -57,7 +62,7 @@ func (job *JobWatchMonitor) Watch() error {
 				job.State = "Started"
 
 				if debug() {
-					fmt.Printf("Starting to watch job %s pods", job.ResourceName)
+					fmt.Printf("Starting to watch job `%s` pods\n", job.ResourceName)
 				}
 
 				go func() {
@@ -91,17 +96,13 @@ func (job *JobWatchMonitor) Watch() error {
 			}
 
 		default:
-			return true, fmt.Errorf("Unknown job %s watcher state: %s", job.ResourceName, job.State)
+			return true, fmt.Errorf("Unknown job `%s` watcher state: %s", job.ResourceName, job.State)
 		}
 
 		return false, nil
 	})
 
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (job *JobWatchMonitor) WatchPods() error {
@@ -133,11 +134,14 @@ func (job *JobWatchMonitor) WatchPods() error {
 	defer cancel()
 
 	_, err = watchtools.UntilWithoutRetry(ctx, podListWatcher, func(e watch.Event) (bool, error) {
-		podObject, ok := e.Object.(*core.Pod)
+		if debug() {
+			fmt.Printf("Job `%s` watcher event: %#v\n", job.ResourceName, e)
+		}
+
+		podObject, ok := e.Object.(*v1.Pod)
 		if !ok {
 			return true, fmt.Errorf("Expected %s to be a *core.Pod, got %T", job.ResourceName, e.Object)
 		}
-
 		for _, pod := range job.MonitoredPods {
 			if pod.ResourceName == podObject.Name {
 				// Already under monitoring
@@ -173,6 +177,10 @@ func (job *JobWatchMonitor) WatchPods() error {
 
 		job.MonitoredPods = append(job.MonitoredPods, pod)
 
+		if debug() {
+			fmt.Printf("Starting job's `%s` pod `%s` monitor\n", job.ResourceName, pod.ResourceName)
+		}
+
 		go func() {
 			err := pod.Watch()
 			if err != nil {
@@ -185,7 +193,7 @@ func (job *JobWatchMonitor) WatchPods() error {
 		return false, nil
 	})
 
-	return nil
+	return err
 }
 
 func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watchFeed JobWatchFeed, opts WatchOptions) error {
@@ -219,7 +227,7 @@ func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watch
 		select {
 		case <-job.Started:
 			if debug() {
-				fmt.Printf("Job %s started", job.ResourceName)
+				fmt.Printf("Job `%s` started\n", job.ResourceName)
 			}
 
 			err := watchFeed.Started()
@@ -229,7 +237,7 @@ func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watch
 
 		case <-job.Succeeded:
 			if debug() {
-				fmt.Printf("%s: Jobs active: %d, jobs failed: %d, jobs succeeded: %d", job.ResourceName, job.FinalJobStatus.Active, job.FinalJobStatus.Failed, job.FinalJobStatus.Succeeded)
+				fmt.Printf("Job `%s` succeeded: pods active: %d, pods failed: %d, pods succeeded: %d\n", job.ResourceName, job.FinalJobStatus.Active, job.FinalJobStatus.Failed, job.FinalJobStatus.Succeeded)
 			}
 
 			err := watchFeed.Succeeded()
@@ -244,7 +252,7 @@ func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watch
 
 		case pod := <-job.AddedPod:
 			if debug() {
-				fmt.Printf("Job %s pod %s added", job.ResourceName, pod.ResourceName)
+				fmt.Printf("Job's `%s` pod `%s` added\n", job.ResourceName, pod.ResourceName)
 			}
 
 			err := watchFeed.AddedPod(pod.ResourceName)
@@ -252,9 +260,13 @@ func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watch
 				return err
 			}
 
-		case podLogChunk := <-job.PodLogChunk:
+		case chunk := <-job.PodLogChunk:
+			if debug() {
+				fmt.Printf("Job's `%s` pod log chunk: %#v", job.ResourceName, chunk)
+			}
+
 			err := watchFeed.LogChunk(JobLogChunk{
-				PodLogChunk: *podLogChunk,
+				PodLogChunk: *chunk,
 				JobName:     job.ResourceName,
 			})
 
@@ -263,6 +275,10 @@ func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watch
 			}
 
 		case podError := <-job.PodError:
+			if debug() {
+				fmt.Printf("Job's `%s` pod error: %#v", job.ResourceName, podError)
+			}
+
 			err := watchFeed.PodError(JobPodError{
 				JobName:  job.ResourceName,
 				PodError: podError,
