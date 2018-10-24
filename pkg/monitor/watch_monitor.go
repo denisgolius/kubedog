@@ -14,3 +14,8 @@ type WatchMonitor struct {
 	ResourceName           string
 	InitialResourceVersion string
 }
+
+type WatchOptions struct {
+	Timeout                time.Duration
+	InitialResourceVersion string
+}

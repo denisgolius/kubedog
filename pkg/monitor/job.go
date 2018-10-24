@@ -1,181 +1,19 @@
 package monitor
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"io"
-	_ "sort"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	_ "k8s.io/apimachinery/pkg/types"
+	_ "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/cli-runtime/pkg/genericclioptions/resource"
+	"k8s.io/client-go/kubernetes"
+	watchtools "k8s.io/client-go/tools/watch"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/core"
 )
-
-type PodWatchMonitor struct {
-	WatchMonitor
-
-	PodLogChunk chan *PodLogChunk
-	PodError    chan PodError
-	Error       chan error
-
-	ContainerMonitorStates          map[string]string
-	ProcessedContainerLogTimestamps map[string]time.Time
-
-	InitContainersNames []string
-	ContainersNames     []string
-}
-
-func (pod *PodWatchMonitor) FollowContainerLogs(containerName string) error {
-	client := pod.Kube
-
-	req := client.Core().
-		Pods(pod.Namespace).
-		GetLogs(pod.ResourceName, &core.PodLogOptions{
-			Container:  containerName,
-			Timestamps: true,
-			Follow:     true,
-		})
-
-	readCloser, err := req.Stream()
-	if err != nil {
-		return err
-	}
-	defer readCloser.Close()
-
-	lineBuf := bytes.Buffer{}
-	rawBuf := make([]byte, 4096)
-
-	for {
-		n, err := readCloser.Read(rawBuf)
-		if err != nil && err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		chunkLines := make([]LogLine, 0)
-		for i := 0; i < n; i++ {
-			if rawBuf[i] == '\n' {
-				lineParts := strings.SplitN(lineBuf.String(), " ", 2)
-				if len(lineParts) == 2 {
-					chunkLines = append(chunkLines, LogLine{Timestamp: lineParts[0], Data: lineParts[1]})
-				}
-
-				lineBuf.Reset()
-				continue
-			}
-
-			lineBuf.WriteByte(rawBuf[i])
-		}
-
-		pod.PodLogChunk <- &PodLogChunk{
-			PodName:       pod.ResourceName,
-			ContainerName: containerName,
-			LogLines:      chunkLines,
-		}
-	}
-
-	return nil
-}
-
-func (pod *PodWatchMonitor) WatchContainerLogs(containerName string) error {
-	for {
-		switch pod.ContainerMonitorStates[containerName] {
-		case "Running", "Terminated":
-			return pod.FollowContainerLogs(containerName)
-		case "Waiting":
-		default:
-		}
-
-		time.Sleep(time.Duration(200) * time.Millisecond)
-	}
-
-	return nil
-}
-
-func (pod *PodWatchMonitor) Watch() error {
-	allContainersNames := make([]string, 0)
-	for _, containerName := range pod.InitContainersNames {
-		allContainersNames = append(allContainersNames, containerName)
-	}
-	for _, containerName := range pod.ContainersNames {
-		allContainersNames = append(allContainersNames, containerName)
-	}
-
-	for i := range allContainersNames {
-		containerName := allContainersNames[i]
-		go func() {
-			err := pod.WatchContainerLogs(containerName)
-			if err != nil {
-				pod.Error <- err
-			}
-		}()
-	}
-
-	client := pod.Kube
-
-	watcher, err := client.Core().Pods(pod.Namespace).
-		Watch(metav1.ListOptions{
-			ResourceVersion: pod.InitialResourceVersion,
-			Watch:           true,
-			FieldSelector:   fields.OneTermEqualSelector("metadata.name", pod.ResourceName).String(),
-		})
-	if err != nil {
-		return err
-	}
-
-	_, err = watch.Until(pod.Timeout, watcher, func(e watch.Event) (bool, error) {
-		object, ok := e.Object.(*core.Pod)
-		if !ok {
-			return true, fmt.Errorf("Expected %s to be a *core.Pod, got %T", pod.ResourceName, e.Object)
-		}
-
-		allContainerStatuses := make([]core.ContainerStatus, 0)
-		for _, cs := range object.Status.InitContainerStatuses {
-			allContainerStatuses = append(allContainerStatuses, cs)
-		}
-		for _, cs := range object.Status.ContainerStatuses {
-			allContainerStatuses = append(allContainerStatuses, cs)
-		}
-
-		for _, cs := range allContainerStatuses {
-			oldState := pod.ContainerMonitorStates[cs.Name]
-
-			if cs.State.Waiting != nil {
-				pod.ContainerMonitorStates[cs.Name] = "Waiting"
-
-				switch cs.State.Waiting.Reason {
-				case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff":
-					pod.PodError <- PodError{
-						ContainerName: cs.Name,
-						PodName:       pod.ResourceName,
-						Message:       fmt.Sprintf("%s: %s", cs.State.Waiting.Reason, cs.State.Waiting.Message),
-					}
-				}
-			}
-			if cs.State.Running != nil {
-				pod.ContainerMonitorStates[cs.Name] = "Running"
-			}
-			if cs.State.Terminated != nil {
-				pod.ContainerMonitorStates[cs.Name] = "Running"
-			}
-
-			if oldState != pod.ContainerMonitorStates[cs.Name] {
-				pod.Kube.Log("Pod %s container %s state changed %v -> %v", pod.ResourceName, cs.Name, oldState, pod.ContainerMonitorStates[cs.Name])
-			}
-		}
-
-		return false, nil
-	})
-
-	return nil
-}
 
 type JobWatchMonitor struct {
 	WatchMonitor
@@ -207,7 +45,10 @@ func (job *JobWatchMonitor) Watch() error {
 		return err
 	}
 
-	_, err = watch.Until(job.Timeout, watcher, func(e watch.Event) (bool, error) {
+	ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), job.Timeout)
+	defer cancel()
+
+	_, err = watchtools.UntilWithoutRetry(ctx, watcher, func(e watch.Event) (bool, error) {
 		switch job.State {
 		case "":
 			if e.Type == watch.Added {
@@ -215,7 +56,9 @@ func (job *JobWatchMonitor) Watch() error {
 
 				job.State = "Started"
 
-				job.Kube.Log("Starting to watch job %s pods", job.ResourceName)
+				if debug() {
+					fmt.Printf("Starting to watch job %s pods", job.ResourceName)
+				}
 
 				go func() {
 					err := job.WatchPods()
@@ -286,8 +129,10 @@ func (job *JobWatchMonitor) WatchPods() error {
 		return err
 	}
 
-	// TODO: calculate timeout since job-watch started
-	_, err = watch.Until(job.Timeout, podListWatcher, func(e watch.Event) (bool, error) {
+	ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), job.Timeout)
+	defer cancel()
+
+	_, err = watchtools.UntilWithoutRetry(ctx, podListWatcher, func(e watch.Event) (bool, error) {
 		podObject, ok := e.Object.(*core.Pod)
 		if !ok {
 			return true, fmt.Errorf("Expected %s to be a *core.Pod, got %T", job.ResourceName, e.Object)
@@ -343,31 +188,15 @@ func (job *JobWatchMonitor) WatchPods() error {
 	return nil
 }
 
-func (c *Client) WatchJobsUntilReady(namespace string, reader io.Reader, watchFeed WatchFeed, timeout time.Duration) error {
-	infos, err := c.Build(namespace, reader)
-	if err != nil {
-		return err
-	}
-
-	return perform(infos, func(info *resource.Info) error {
-		return c.watchJobUntilReady(info, watchFeed, timeout)
-	})
-}
-
-func (c *Client) watchJobUntilReady(jobInfo *resource.Info, watchFeed WatchFeed, timeout time.Duration) error {
-	if jobInfo.Mapping.GroupVersionKind.Kind != "Job" {
-		return nil
-	}
-
-	// TODO: constructor
+func WatchJobUntilReady(name, namespace string, kube kubernetes.Interface, watchFeed JobWatchFeed, opts WatchOptions) error {
 	job := &JobWatchMonitor{
 		WatchMonitor: WatchMonitor{
-			Kube:    c,
-			Timeout: timeout,
+			Kube:    kube,
+			Timeout: opts.Timeout,
 
-			Namespace:              jobInfo.Namespace,
-			ResourceName:           jobInfo.Name,
-			InitialResourceVersion: jobInfo.ResourceVersion,
+			Namespace:              namespace,
+			ResourceName:           name,
+			InitialResourceVersion: opts.InitialResourceVersion,
 		},
 
 		Started:     make(chan bool, 0),
@@ -389,24 +218,59 @@ func (c *Client) watchJobUntilReady(jobInfo *resource.Info, watchFeed WatchFeed,
 	for {
 		select {
 		case <-job.Started:
-			c.Log("Job %s started", job.ResourceName)
+			if debug() {
+				fmt.Printf("Job %s started", job.ResourceName)
+			}
+
+			err := watchFeed.Started()
+			if err != nil {
+				return err
+			}
+
 		case <-job.Succeeded:
-			c.Log("%s: Jobs active: %d, jobs failed: %d, jobs succeeded: %d", job.ResourceName, job.FinalJobStatus.Active, job.FinalJobStatus.Failed, job.FinalJobStatus.Succeeded)
+			if debug() {
+				fmt.Printf("%s: Jobs active: %d, jobs failed: %d, jobs succeeded: %d", job.ResourceName, job.FinalJobStatus.Active, job.FinalJobStatus.Failed, job.FinalJobStatus.Succeeded)
+			}
+
+			err := watchFeed.Succeeded()
+			if err != nil {
+				return err
+			}
+
 			return nil
+
 		case err := <-job.Error:
 			return err
+
 		case pod := <-job.AddedPod:
-			c.Log("Job %s pod %s added", job.ResourceName, pod.ResourceName)
+			if debug() {
+				fmt.Printf("Job %s pod %s added", job.ResourceName, pod.ResourceName)
+			}
+
+			err := watchFeed.AddedPod(pod.ResourceName)
+			if err != nil {
+				return err
+			}
+
 		case podLogChunk := <-job.PodLogChunk:
-			watchFeed.WriteJobLogChunk(JobLogChunk{
+			err := watchFeed.LogChunk(JobLogChunk{
 				PodLogChunk: *podLogChunk,
 				JobName:     job.ResourceName,
 			})
+
+			if err != nil {
+				return err
+			}
+
 		case podError := <-job.PodError:
-			watchFeed.WriteJobPodError(JobPodError{
+			err := watchFeed.PodError(JobPodError{
 				JobName:  job.ResourceName,
 				PodError: podError,
 			})
+
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
